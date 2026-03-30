@@ -23,7 +23,7 @@ library(ggvenn)
 # ---------------- Paths ----------------
 counts_file <- "C:/Users/User/Documents/Damola/counts/gene_counts.txt"  ## counts file
 meta_file   <- "C:/Users/User/Documents/Damola/counts/samples.csv"  ## metadata samples file
-out_dir     <- "C:/Users/User/Documents/Damola/deseq2_doxy_0.56"    ## output directory
+out_dir     <- "C:/Users/User/Documents/Damola/deseq2_doxy_0.56-v2"    ## output directory
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 setwd(out_dir)
 
@@ -51,9 +51,10 @@ stopifnot(all(colnames(count_mat) == meta$sample))
 doxy_samples <- meta %>% filter(treatment == "doxy") %>% select(sample,genotype,replicate)   ### select only doxy treated samples
 count_doxy <- count_mat[, doxy_samples$sample]   ### extract the counts for the doxy treated samples
 stopifnot(all(colnames(count_doxy) == doxy_samples$sample))
+write.csv(doxy_samples,file="samples.csv",row.names = F)
 
 # Factors and reference levels
-doxy_samples$genotype  <- factor(doxy_samples$genotype,  levels = c("GL", "G0", "G1", "G2"))
+doxy_samples$genotype  <- factor(doxy_samples$genotype,  levels = c("EV", "G0", "G1", "G2"))
 doxy_samples$replicate <- factor(doxy_samples$replicate)
 
 # DESeq2 object
@@ -87,7 +88,7 @@ annotate_results <- function(res) {
 # HELPER FUNCTION: VOLCANO
 # ==============================================================================
 plot_volcano <- function(res_annot, title, file) {
-  volc <- res_annot %>%
+volc <- res_annot %>%
     mutate(
       neglog10padj = -log10(padj),
       sig = case_when(
@@ -95,6 +96,8 @@ plot_volcano <- function(res_annot, title, file) {
         TRUE ~ "Not significant"
       )
     )
+df <- volc %>% filter(sig == "Significant")
+write.csv(df,paste0(title,"_filtered.csv"),row.names = F)
 y_cap <- 50
 volc$neglog10padj_capped <- pmin(volc$neglog10padj, y_cap)
 
@@ -170,11 +173,12 @@ ggsave(file, p, width = 6, height = 5, dpi = 300)
 # ==============================================================================
 # This function plots a heatmap of the top DE genes using VST‑normalized expression values, 
 ## scaled by row (Z‑score), to highlight relative up‑ and down‑regulation across samples
-plot_heatmap <- function(dds, res_annot, title, file, n_genes = 20) {
+plot_heatmap <- function(dds, res_annot, title, file, n_genes = 50) {
   # 1. Select top genes
   top_sig <- res_annot %>%
     filter(!is.na(SYMBOL)) %>%
-    arrange(padj) %>%
+    #arrange(padj) %>%
+    filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% 
     head(n_genes)
   
   # Ensure genes exist in the VST matrix
@@ -187,20 +191,19 @@ plot_heatmap <- function(dds, res_annot, title, file, n_genes = 20) {
   rownames(plot_mat) <- top_sig$SYMBOL
   
   # 3. Annotation
-  # 3. Annotation
   anno_col <- as.data.frame(colData(dds)[, "genotype", drop = FALSE])
-  
+
   # Drop unused levels in the annotation column
   anno_col$genotype <- droplevels(anno_col$genotype)
-  
+
   # Full palette
   full_colors <- c(
-    "GL" = "#D4AF37",
+    "EV" = "#D4AF37",
     "G0" = "#00CED1",
     "G1" = "brown",
     "G2" = "orange"
   )
-  
+
   # Restrict palette to genotypes present in this subset
   present_genotypes <- levels(anno_col$genotype)
   anno_colors <- list(genotype = full_colors[present_genotypes])
@@ -224,38 +227,40 @@ plot_heatmap <- function(dds, res_annot, title, file, n_genes = 20) {
 ### Differential analysis
 ## ==========================================================================================
 #### Visualize clustering
-plot_pca(dds,"PCA: doxy-only samples","pca_doxy_only_0.56.png")  ### plot PCA
+plot_pca(dds,"Doxycline treated samples","pca_doxy_only_0.56.png")  ### plot PCA
+
+res_G0_vs_EV <- results(dds, contrast = c("genotype", "G0", "EV"))
+res_G1_vs_EV <- results(dds, contrast = c("genotype", "G1", "EV"))
+res_G2_vs_EV <- results(dds, contrast = c("genotype", "G2", "EV"))
+
+# G0 vs EV
+res_G0_EV <- lfcShrink(dds,coef = "genotype_G0_vs_EV",res = res_G0_vs_EV,type = "apeglm")   ## shrink the log fold change
+res_G0_EV_annot <- annotate_results(res_G0_EV)    ## annotate the result with the Gene symbol
+write.csv(res_G0_EV_annot, "doxy_G0_vs_EV_results_0.56.csv", row.names = FALSE)  ### save to a csv file
+plot_volcano(res_G0_EV_annot,"Doxycycline_treated_G0_vs_EV","volcano_doxy_G0_vs_EV_0.56.png")   ### plot volcano
+
+# G1 vs EV
+res_G1_EV <- lfcShrink(dds,coef = "genotype_G1_vs_EV",res = res_G1_vs_EV,type = "apeglm")   ## shrink the log fold change
+res_G1_EV_annot <- annotate_results(res_G1_EV)    ## annotate the result with the Gene symbol
+write.csv(res_G1_EV_annot, "doxy_G1_vs_EV_results_0.56.csv", row.names = FALSE)  ### save to a csv file
+plot_volcano(res_G1_EV_annot,"Doxycycline_treated_G1_vs_EV","volcano_doxy_G1_vs_EV_0.56.png")   ### plot volcano
 
 
-res_G0_vs_GL <- results(dds, contrast = c("genotype", "G0", "GL"))
-res_G1_vs_GL <- results(dds, contrast = c("genotype", "G1", "GL"))
-res_G2_vs_GL <- results(dds, contrast = c("genotype", "G2", "GL"))
-
-# G0 vs GL
-res_G0_GL <- lfcShrink(dds,coef = "genotype_G0_vs_GL",res = res_G0_vs_GL,type = "apeglm")   ## shrink the log fold change
-res_G0_GL_annot <- annotate_results(res_G0_GL)    ## annotate the result with the Gene symbol
-write.csv(res_G0_GL_annot, "doxy_G0_vs_GL_results_0.56.csv", row.names = FALSE)  ### save to a csv file
-plot_volcano(res_G0_GL_annot,"Volcano: doxy-treated, G0 vs GL","volcano_doxy_G0_vs_GL_0.56.png")   ### plot volcano
-
-# G1 vs GL
-res_G1_GL <- lfcShrink(dds,coef = "genotype_G1_vs_GL",res = res_G1_vs_GL,type = "apeglm")   ## shrink the log fold change
-res_G1_GL_annot <- annotate_results(res_G1_GL)    ## annotate the result with the Gene symbol
-write.csv(res_G1_GL_annot, "doxy_G1_vs_GL_results_0.56.csv", row.names = FALSE)  ### save to a csv file
-plot_volcano(res_G1_GL_annot,"Volcano: doxy-treated, G1 vs GL","volcano_doxy_G1_vs_GL_0.56.png")   ### plot volcano
-
-# G2 vs GL
-res_G2_GL <- lfcShrink(dds,coef = "genotype_G2_vs_GL",res = res_G2_vs_GL,type = "apeglm")   ## shrink the log fold change
-res_G2_GL_annot <- annotate_results(res_G2_GL)    ## annotate the result with the Gene symbol
-write.csv(res_G2_GL_annot, "doxy_G2_vs_GL_results_0.56.csv", row.names = FALSE)  ### save to a csv file
-plot_volcano(res_G2_GL_annot,"Volcano: doxy-treated, G2 vs GL","volcano_doxy_G2_vs_GL_0.56.png")   ### plot volcano
+# G2 vs EV
+res_G2_EV <- lfcShrink(dds,coef = "genotype_G2_vs_EV",res = res_G2_vs_EV,type = "apeglm")   ## shrink the log fold change
+res_G2_EV_annot <- annotate_results(res_G2_EV)    ## annotate the result with the Gene symbol
+write.csv(res_G2_EV_annot, "doxy_G2_vs_EV_results_0.56.csv", row.names = FALSE)  ### save to a csv file
+plot_volcano(res_G2_EV_annot,"Doxycycline_treated_G2_vs_EV","volcano_doxy_G2_vs_EV_0.56.png")   ### plot volcano
 
 ###################################################
 ### Venn diagram
 ### Significant genes within doxy treated 
-sig_G0 <- res_G0_GL_annot %>% filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% pull(SYMBOL) %>% na.omit()
-sig_G1 <- res_G1_GL_annot %>% filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% pull(SYMBOL) %>% na.omit()
-sig_G2 <- res_G2_GL_annot %>% filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% pull(SYMBOL) %>% na.omit()
-
+sig_G0 <- res_G0_EV_annot %>% filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% pull(SYMBOL) %>% na.omit()
+sig_G1 <- res_G1_EV_annot %>% filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% pull(SYMBOL) %>% na.omit()
+sig_G2 <- res_G2_EV_annot %>% filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>% pull(SYMBOL) %>% na.omit()
+write.csv(sig_G0,"list_of_genes_in_Venn_plot_for_G0_vs_EV.csv")
+write.csv(sig_G1,"list_of_genes_in_Venn_plot_for_G1_vs_EV.csv")
+write.csv(sig_G2,"list_of_genes_in_Venn_plot_for_G2_vs_EV.csv")
 
 ### variations of venn diagram
 ### option 1
@@ -265,7 +270,7 @@ venn.plot <- venn.diagram( x = list(G0 = unique(sig_G0),G1 = unique(sig_G1),G2 =
   alpha = 0.5,
   cex = 2,
   cat.cex = 2,
-  main = "Overlap of DE genes (doxy-only)"
+  main = "Overlap of DEGs in the doxycycline treated samples"
 )
 
 # Option 2. Create the plot
@@ -273,10 +278,9 @@ gene_list <- list(G0 = unique(sig_G0),G1 = unique(sig_G1),G2 = unique(sig_G2))
 p_venn <- ggVennDiagram(gene_list, label_alpha = 0) +
   scale_fill_gradient(low = "#F4FAFE", high = "#4981BF") + # Professional Blue Gradient
   theme(legend.position = "none") +
-  labs(title = "Overlap of DEGs (Doxy-only)",
+  labs(title = "Overlap of DEGs in the doxycycline treated samples",
        subtitle = "Significant genes")
 #Display and Save
-print(p_venn)
 ggsave("venn_doxy_treated.png", p_venn, width = 7, height = 6, dpi = 300)
 
 ## option 3
@@ -288,41 +292,77 @@ p_ggvenn <- ggvenn(
   set_name_size = 5,
   text_size = 4
 ) +
-  ggtitle("Overlap of DE genes (doxy-only)")
-print(p_ggvenn)
-
+  ggtitle("Overlap of DEGs in the doxycycline treated samples")
 
 # ==============================================================================
 # APPLYING HEATMAPS TO CREATE PLOTS
 # ==============================================================================
-# G2 vs GL
-dds_G2_GL <- dds[, dds$genotype %in% c("G2", "GL")] ### create a subset
-dds_G2_GL$genotype <- droplevels(dds_G2_GL$genotype)  ## droplevels removes factors that no longer appear in the subset
-dds_G2_GL$replicate <- droplevels(dds_G2_GL$replicate)
-### plot
-plot_heatmap(dds = dds_G2_GL, 
-             res_annot  = res_G2_GL_annot, 
-             title      = "Heatmap: G2 vs GL @ 0.56 lfc", 
-             file       = "heatmap_G2vsGL.png")
+# G2 vs EV
+dds_G2_EV <- dds[, dds$genotype %in% c("G2", "EV")] ### create a subset
+dds_G2_EV$genotype <- droplevels(dds_G2_EV$genotype)  ## droplevels removes factors that no longer appear in the subset
+dds_G2_EV$replicate <- droplevels(dds_G2_EV$replicate)
+plot_heatmap(dds = dds_G2_EV, res_annot  = res_G2_EV_annot, title = "DEGs G2_vs_EV", file = "heatmap_G2_vs_EV.png")
 
-## G1 vs GL
-dds_G1_GL <- dds[, dds$genotype %in% c("G1", "GL")] ### create a subset
-dds_G1_GL$genotype <- droplevels(dds_G1_GL$genotype)  ## droplevels removes factors that no longer appear in the subset
-dds_G1_GL$replicate <- droplevels(dds_G1_GL$replicate)
-plot_heatmap(dds = dds_G1_GL, 
-             res_annot  = res_G1_GL_annot, 
-             title      = "Heatmap: G1 vs GL @ 0.56 lfc", 
-             file       = "heatmap_G1vsGL.png")
+## G1 vs EV
+dds_G1_EV <- dds[, dds$genotype %in% c("G1", "EV")] ### create a subset
+dds_G1_EV$genotype <- droplevels(dds_G1_EV$genotype)  ## droplevels removes factors that no longer appear in the subset
+dds_G1_EV$replicate <- droplevels(dds_G1_EV$replicate)
+plot_heatmap(dds = dds_G1_EV,res_annot = res_G1_EV_annot, title = "DEGs G1 vs EV", file = "heatmap_G1_vs_EV.png")
 
-## G0 vs GL
-dds_G0_GL <- dds[, dds$genotype %in% c("G0", "GL")] ### create a subset
-dds_G0_GL$genotype <- droplevels(dds_G0_GL$genotype)  ## droplevels removes factors that no longer appear in the subset
-dds_G0_GL$replicate <- droplevels(dds_G0_GL$replicate)
-plot_heatmap(dds = dds_G0_GL, 
-             res_annot  = res_G0_GL_annot, 
-             title      = "Heatmap: G0 vs GL @ 0.56 lfc", 
-             file       = "heatmap_G0vsGL.png")
+## G0 vs EV
+dds_G0_EV <- dds[, dds$genotype %in% c("G0", "EV")] ### create a subset
+dds_G0_EV$genotype <- droplevels(dds_G0_EV$genotype)  ## droplevels removes factors that no longer appear in the subset
+dds_G0_EV$replicate <- droplevels(dds_G0_EV$replicate)
+plot_heatmap(dds = dds_G0_EV,res_annot  = res_G0_EV_annot, title = "DEGs G0 vs EV", file = "heatmap_G0vsEV.png")
 
+## ====================
+####### Genotype progression
+vsd <- vst(dds, blind = FALSE)
+mat <- assay(vsd)
+rownames(mat) <- sub("\\..*", "", rownames(mat))  ### remove decimal values 
+### convert to data frames
+res_G0_df <- as.data.frame(res_G0_EV_annot)
+res_G1_df <- as.data.frame(res_G1_EV_annot)
+res_G2_df <- as.data.frame(res_G2_EV_annot)
+### replace the gene_id column with the formatted values in the ENSEMBL column
+res_G0_df$gene_id <- res_G0_df$ENSEMBL
+res_G1_df$gene_id <- res_G1_df$ENSEMBL
+res_G2_df$gene_id <- res_G2_df$ENSEMBL
+### filter using p_adj and lfc
+sig_G0 <- res_G0_df[ abs(res_G0_df$log2FoldChange) >= 0.56 &res_G0_df$padj < 0.05, ]
+sig_G1 <- res_G1_df[abs(res_G1_df$log2FoldChange) >= 0.56 & res_G1_df$padj < 0.05, ]
+sig_G2 <- res_G2_df[abs(res_G2_df$log2FoldChange) >= 0.56 & res_G2_df$padj < 0.05, ]
+### combine into a single df
+res_all <- dplyr::bind_rows(sig_G0, sig_G1, sig_G2)
+## rank by statistical significance
+top100 <- res_all %>% arrange(padj) %>% head(100)  ## sort by pdj in ascending order and take the first 100
+#top100 <- res_all %>% arrange(padj, desc(abs(log2FoldChange))) %>% head(100)
+top100_unique <- top100[!duplicated(top100$SYMBOL), ]
+heatmap_mat <- mat[top100_unique$gene_id, ]
+rownames(heatmap_mat) <- top100_unique$SYMBOL
+### reorder the columns to show progresion of DEGs
+desired_order <- c("G2", "G1", "G0", "EV")
+sample_info <- as.data.frame(colData(dds))
+ordered_samples <- rownames(sample_info)[order(factor(sample_info$genotype, levels = desired_order))]
+heatmap_mat <- heatmap_mat[, ordered_samples]
+anno_col <- anno_col[ordered_samples, , drop = FALSE]
+## plot
+file <- "genotype_progression_heatmap.png"
+png(file, width = 800, height = 1000, res = 120)
+pheatmap(
+  heatmap_mat,
+  scale = "row",  ## convert expression values to Zscore
+  cluster_cols = FALSE,   # keeps the order of the genotypes
+  cluster_rows = TRUE,
+  annotation_col = anno_col,
+  annotation_colors = anno_colors,
+  clustering_method = "ward.D2",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  show_colnames = F,
+  fontsize_row = 5,
+  main = "Progression of DEGs in Doxycycline treated samples"
+)
+dev.off()
 
 
 ### ================================================================================
@@ -439,3 +479,4 @@ plot_gsva_heatmap(gsva_GL, "Top Reactome Pathways: GL Activity", "gsva_heatmap_G
 plot_gsva_heatmap(gsva_G2, "Top Reactome Pathways: G2 Activity", "gsva_heatmap_G2.png")
 plot_gsva_heatmap(gsva_G1, "Top Reactome Pathways: G1 Activity", "gsva_heatmap_G1.png")
 plot_gsva_heatmap(gsva_G0, "Top Reactome Pathways: G0 Activity", "gsva_heatmap_G0.png")
+
