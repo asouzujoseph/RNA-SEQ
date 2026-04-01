@@ -39,7 +39,7 @@ colnames(count_mat) <- sub("\\.bam$", "", colnames(count_mat))
 
 count_mat <- as.matrix(count_mat)
 storage.mode(count_mat) <- "integer"
-
+write.csv(count_mat,"gene_counts_formatted.csv")
 # ---------------- Load metadata ----------------
 meta <- read.csv(meta_file, stringsAsFactors = FALSE)
 meta <- meta[match(colnames(count_mat), meta$sample), ]
@@ -294,6 +294,7 @@ p_ggvenn <- ggvenn(
 ) +
   ggtitle("Overlap of DEGs in the doxycycline treated samples")
 
+##### https://www.sc-best-practices.org/introduction/prior_art.html
 # ==============================================================================
 # APPLYING HEATMAPS TO CREATE PLOTS
 # ==============================================================================
@@ -345,7 +346,16 @@ desired_order <- c("G2", "G1", "G0", "EV")
 sample_info <- as.data.frame(colData(dds))
 ordered_samples <- rownames(sample_info)[order(factor(sample_info$genotype, levels = desired_order))]
 heatmap_mat <- heatmap_mat[, ordered_samples]
-anno_col <- anno_col[ordered_samples, , drop = FALSE]
+
+# Annotation for heatmap
+anno_col <- as.data.frame(colData(dds)[, "genotype", drop = FALSE])
+anno_col <- anno_col[ordered_samples,,drop = FALSE]
+# Full palette
+full_colors <- c("EV" = "#D4AF37","G0" = "#00CED1", "G1" = "brown", "G2" = "orange")
+# Restrict palette to genotypes present in this subset
+present_genotypes <- levels(anno_col$genotype)
+anno_colors <- list(genotype = full_colors[present_genotypes])
+
 ## plot
 file <- "genotype_progression_heatmap.png"
 png(file, width = 800, height = 1000, res = 120)
@@ -365,11 +375,221 @@ pheatmap(
 dev.off()
 
 
-### ================================================================================
-##  REACTOME PATHWAY ANALYSIS
-## =================================================================================
-
+## ================================================================================
+#  REACTOME PATHWAY ANALYSIS
+# =================================================================================
 # 1. Load Reactome pathways (gene symbols)
+reactome_df <- msigdbr(species = "Homo sapiens",category = "C2",subcategory = "CP:REACTOME")
+reactome_gs <- split(reactome_df$gene_symbol, reactome_df$gs_name)
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+# Convert ENSEMBL → SYMBOL
+convert_to_symbol <- function(mat) {
+  ens <- sub("\\..*", "", rownames(mat))
+
+  mapping <- AnnotationDbi::select(org.Hs.eg.db,keys = ens,columns = "SYMBOL", keytype = "ENSEMBL")
+
+  mapping <- mapping[!is.na(mapping$SYMBOL), ]
+  mapping <- mapping[!duplicated(mapping$ENSEMBL), ]
+  mapping <- mapping[mapping$ENSEMBL %in% ens, ]
+
+  mat2 <- mat[match(mapping$ENSEMBL, ens), , drop = FALSE]
+  rownames(mat2) <- mapping$SYMBOL
+  mat2
+}
+
+# Collapse duplicate SYMBOL rows
+collapse_duplicates <- function(mat) {
+  df <- as.data.frame(mat)
+  df$symbol <- rownames(df)
+
+  df <- df %>%
+    group_by(symbol) %>%
+    summarise(across(everything(), sum)) %>%
+    as.data.frame()
+
+  rownames(df) <- df$symbol
+  df$symbol <- NULL
+  as.matrix(df)
+}
+
+# ==============================================================================
+# HEATMAP FUNCTION FOR PATHWAY ACTIVITY
+# ==============================================================================
+
+plot_gsva_heatmap <- function(gsva_results, title, file) {
+  png(file, width = 1000, height = 800, res = 120)
+  # Select top 30 pathways by variance
+  pathway_vars <- apply(gsva_results, 1, var)
+  top_pathways <- gsva_results[order(pathway_vars, decreasing = TRUE)[1:30], ]
+  pheatmap(top_pathways,main = title,scale = "row",color = colorRampPalette(c("blue", "white", "red"))(100),fontsize_row = 7)
+  dev.off()
+}
+# ==============================================================================
+# PREPARE EXPRESSION MATRIX FOR GSVA
+# ==============================================================================
+# Use VST-normalized counts (best practice for GSVA)
+vsd <- vst(dds, blind = FALSE)
+mat <- assay(vsd)
+# Convert ENSEMBL → SYMBOL and collapse duplicates
+mat_sym <- convert_to_symbol(mat)
+mat_sym <- collapse_duplicates(mat_sym)
+# ==============================================================================
+# RUN GSVA (ONE TIME ONLY)
+# ==============================================================================
+param <- ssgseaParam(mat_sym, reactome_gs)
+gsva_all <- GSVA::gsva(param)   # pathways × samples matrix
+# ==============================================================================
+# SUBSET GSVA SCORES BY GENOTYPE
+# ==============================================================================
+gsva_G0 <- gsva_all[, dds$genotype == "G0", drop = FALSE]
+gsva_G1 <- gsva_all[, dds$genotype == "G1", drop = FALSE]
+gsva_G2 <- gsva_all[, dds$genotype == "G2", drop = FALSE]
+gsva_EV <- gsva_all[, dds$genotype == "EV", drop = FALSE]
+
+
+# ==============================================================================
+# PLOT GENOTYPE-SPECIFIC PATHWAY ACTIVITY
+# ==============================================================================
+plot_gsva_heatmap(gsva_EV, "Top Reactome Pathways: EV Activity", "gsva_heatmap_GL.png")
+plot_gsva_heatmap(gsva_G2, "Top Reactome Pathways: G2 Activity", "gsva_heatmap_G2.png")
+plot_gsva_heatmap(gsva_G1, "Top Reactome Pathways: G1 Activity", "gsva_heatmap_G1.png")
+plot_gsva_heatmap(gsva_G0, "Top Reactome Pathways: G0 Activity", "gsva_heatmap_G0.png")
+
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(GSVA)
+library(GSEABase)
+library(tidyverse)
+convert_ids <- function(df) {
+  bitr(df$gene_id,
+       fromType = "ENSEMBL",
+       toType = "ENTREZID",
+       OrgDb = org.Hs.eg.db) %>%
+    pull(ENTREZID)
+}
+
+entrez_G0 <- convert_ids(sig_G0)
+entrez_G1 <- convert_ids(sig_G1)
+entrez_G2 <- convert_ids(sig_G2)
+
+reactome_G0 <- enrichPathway(entrez_G0, organism = "human", pvalueCutoff = 0.05, readable = TRUE)
+reactome_G1 <- enrichPathway(entrez_G1, organism = "human", pvalueCutoff = 0.05, readable = TRUE)
+reactome_G2 <- enrichPathway(entrez_G2, organism = "human", pvalueCutoff = 0.05, readable = TRUE)
+
+dotplot(reactome_G0, showCategory = 15) + ggtitle("Reactome – G0 vs EV")
+dotplot(reactome_G1, showCategory = 15) + ggtitle("Reactome – G1 vs EV")
+dotplot(reactome_G2, showCategory = 15) + ggtitle("Reactome – G2 vs EV")
+
+## Enrich GO
+ego_G0 <- enrichGO(entrez_G0, OrgDb = org.Hs.eg.db, keyType = "ENTREZID",ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+ego_G1 <- enrichGO(entrez_G1, OrgDb = org.Hs.eg.db, keyType = "ENTREZID",ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+ego_G2 <- enrichGO(entrez_G2, OrgDb = org.Hs.eg.db, keyType = "ENTREZID",ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+dotplot(ego_G0, showCategory = 15)
+dotplot(ego_G1, showCategory = 15)
+dotplot(ego_G2, showCategory = 15)
+
+### KEGG pathway
+kegg_G0 <- enrichKEGG(entrez_G0, organism = "hsa", pvalueCutoff = 0.05)
+kegg_G1 <- enrichKEGG(entrez_G1, organism = "hsa", pvalueCutoff = 0.05)
+kegg_G2 <- enrichKEGG(entrez_G2, organism = "hsa", pvalueCutoff = 0.05)
+dotplot(kegg_G0, showCategory = 15)
+dotplot(kegg_G1, showCategory = 15)
+dotplot(kegg_G2, showCategory = 15)
+
+## GSEA
+rank_genes <- function(df) {
+  # Convert ENSEMBL → ENTREZ
+  conv <- bitr(df$gene_id,
+               fromType = "ENSEMBL",
+               toType = "ENTREZID",
+               OrgDb = org.Hs.eg.db)
+  
+  # Merge ENTREZ IDs back into the results
+  df2 <- df %>%
+    dplyr::inner_join(conv, by = c("gene_id" = "ENSEMBL"))
+  
+  # Remove duplicated ENTREZ IDs
+  df2 <- df2[!duplicated(df2$ENTREZID), ]
+  
+  # Create ranked list
+  ranks <- df2$log2FoldChange
+  names(ranks) <- df2$ENTREZID
+  
+  sort(ranks, decreasing = TRUE)
+}
+
+rank_G0 <- rank_genes(res_G0_df)
+rank_G1 <- rank_genes(res_G1_df)
+rank_G2 <- rank_genes(res_G2_df)
+
+gsea_G0 <- gsePathway(rank_G0, organism = "human", pvalueCutoff = 0.05)
+gsea_G1 <- gsePathway(rank_G1, organism = "human", pvalueCutoff = 0.05)
+gsea_G2 <- gsePathway(rank_G2, organism = "human", pvalueCutoff = 0.05)
+
+ridgeplot(gsea_G0)
+ridgeplot(gsea_G1)
+ridgeplot(gsea_G2)
+
+# emapplot(gsea_G0)
+# emapplot(gsea_G1)
+# emapplot(gsea_G2)
+
+####GSVA (Gene Set Variation Analysis)
+reactome_gmt <- getGmt("ReactomePathways.gmt")
+gs_list <- lapply(reactome_gmt, function(gs) {
+  geneIds(gs)
+})
+names(gs_list) <- sapply(reactome_gmt, function(gs) gs@setName)
+gsva_scores <- gsva(
+  expr = as.matrix(mat),
+  gset.idx.list = gs_list,
+  method = "gsva",
+  kcdf = "Gaussian"   # correct for VST data
+)
+
+
+pheatmap(gsva_scores,cluster_cols = FALSE,show_rownames = FALSE,main = "Reactome Pathway Activity (GSVA)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## ================================================================================
+## 1. Load Reactome pathways (msigdbr, SYMBOL-based)
+## ================================================================================
 reactome_df <- msigdbr(
   species = "Homo sapiens",
   category = "C2",
@@ -379,11 +599,11 @@ reactome_df <- msigdbr(
 reactome_gs <- split(reactome_df$gene_symbol, reactome_df$gs_name)
 
 
-# ==============================================================================
-# HELPER FUNCTIONS
-# ==============================================================================
+## ================================================================================
+## 2. Helper functions
+## ================================================================================
 
-# Convert ENSEMBL → SYMBOL
+### ENSEMBL → SYMBOL
 convert_to_symbol <- function(mat) {
   ens <- sub("\\..*", "", rownames(mat))
   
@@ -394,16 +614,30 @@ convert_to_symbol <- function(mat) {
     keytype = "ENSEMBL"
   )
   
+  # Remove NA symbols
   mapping <- mapping[!is.na(mapping$SYMBOL), ]
-  mapping <- mapping[!duplicated(mapping$ENSEMBL), ]
+  
+  # Keep only ENSEMBL IDs that exist in the matrix
   mapping <- mapping[mapping$ENSEMBL %in% ens, ]
   
-  mat2 <- mat[match(mapping$ENSEMBL, ens), , drop = FALSE]
+  # Remove duplicated ENSEMBL IDs
+  mapping <- mapping[!duplicated(mapping$ENSEMBL), ]
+  
+  # Reorder mapping to match matrix order
+  mapping <- mapping[match(ens, mapping$ENSEMBL), ]
+  mapping <- mapping[!is.na(mapping$ENSEMBL), ]
+  
+  # Subset matrix safely
+  mat2 <- mat[mapping$ENSEMBL, , drop = FALSE]
+  
+  # Assign SYMBOL rownames
   rownames(mat2) <- mapping$SYMBOL
+  
   mat2
 }
 
-# Collapse duplicate SYMBOL rows
+
+### Collapse duplicate SYMBOL rows
 collapse_duplicates <- function(mat) {
   df <- as.data.frame(mat)
   df$symbol <- rownames(df)
@@ -418,17 +652,69 @@ collapse_duplicates <- function(mat) {
   as.matrix(df)
 }
 
-# ==============================================================================
-# HEATMAP FUNCTION FOR PATHWAY ACTIVITY
-# ==============================================================================
+### Convert ENSEMBL → ENTREZ (vector input)
+convert_ids <- function(ensembl_ids) {
+  conv <- bitr(
+    ensembl_ids,
+    fromType = "ENSEMBL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db
+  )
+  unique(conv$ENTREZID)
+}
 
+### Create ranked vector for GSEA
+rank_genes <- function(df) {
+  conv <- bitr(
+    df$gene_id,
+    fromType = "ENSEMBL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db
+  )
+  
+  df2 <- df %>%
+    inner_join(conv, by = c("gene_id" = "ENSEMBL")) %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+  
+  ranks <- df2$stat
+  names(ranks) <- df2$ENTREZID
+  sort(ranks, decreasing = TRUE)
+}
+
+
+## ================================================================================
+## 3. Prepare VST matrix for GSVA
+## ================================================================================
+vsd <- vst(dds, blind = FALSE)
+mat <- assay(vsd)
+
+mat_sym <- convert_to_symbol(mat)
+mat_sym <- collapse_duplicates(mat_sym)
+
+
+## ================================================================================
+## 4. Run ssGSEA (GSVA)
+## ================================================================================
+param <- ssgseaParam(mat_sym, reactome_gs)
+gsva_all <- GSVA::gsva(param)
+
+
+## ================================================================================
+## 5. Subset GSVA scores by genotype
+## ================================================================================
+gsva_G0 <- gsva_all[, dds$genotype == "G0", drop = FALSE]
+gsva_G1 <- gsva_all[, dds$genotype == "G1", drop = FALSE]
+gsva_G2 <- gsva_all[, dds$genotype == "G2", drop = FALSE]
+gsva_EV <- gsva_all[, dds$genotype == "EV", drop = FALSE]
+
+
+## ================================================================================
+## 6. Plot GSVA heatmaps
+## ================================================================================
 plot_gsva_heatmap <- function(gsva_results, title, file) {
   png(file, width = 1000, height = 800, res = 120)
-  
-  # Select top 30 pathways by variance
   pathway_vars <- apply(gsva_results, 1, var)
   top_pathways <- gsva_results[order(pathway_vars, decreasing = TRUE)[1:30], ]
-  
   pheatmap(
     top_pathways,
     main = title,
@@ -436,47 +722,373 @@ plot_gsva_heatmap <- function(gsva_results, title, file) {
     color = colorRampPalette(c("blue", "white", "red"))(100),
     fontsize_row = 7
   )
-  
+  dev.off()
+}
+
+plot_gsva_heatmap(gsva_EV, "Reactome Pathways – EV", "gsva_EV.png")
+plot_gsva_heatmap(gsva_G0, "Reactome Pathways – G0", "gsva_G0.png")
+plot_gsva_heatmap(gsva_G1, "Reactome Pathways – G1", "gsva_G1.png")
+plot_gsva_heatmap(gsva_G2, "Reactome Pathways – G2", "gsva_G2.png")
+
+
+## ================================================================================
+## 7. Over-representation analysis (Reactome, GO, KEGG)
+## ================================================================================
+
+### DEG lists must contain ENSEMBL IDs
+entrez_G0 <- convert_ids(sub("\\..*", "", sig_G0$gene_id))
+entrez_G1 <- convert_ids(sub("\\..*", "", sig_G1$gene_id))
+entrez_G2 <- convert_ids(sub("\\..*", "", sig_G2$gene_id))
+
+
+### Universe = all genes tested in DESeq2
+
+universe_ens <- sub("\\..*", "", rownames(dds))
+valid_ens <- universe_ens[universe_ens %in% keys(org.Hs.eg.db, keytype = "ENSEMBL")]
+universe_entrez <- convert_ids(valid_ens)
+
+
+
+### ReactomePA
+reactome_G0 <- enrichPathway(entrez_G0, organism = "human",
+                             universe = universe_entrez,
+                             pvalueCutoff = 0.05, readable = TRUE)
+
+reactome_G1 <- enrichPathway(entrez_G1, organism = "human",
+                             universe = universe_entrez,
+                             pvalueCutoff = 0.05, readable = TRUE)
+
+reactome_G2 <- enrichPathway(entrez_G2, organism = "human",
+                             universe = universe_entrez,
+                             pvalueCutoff = 0.05, readable = TRUE)
+
+
+### GO Biological Process
+ego_G0 <- enrichGO(entrez_G0, OrgDb = org.Hs.eg.db,
+                   keyType = "ENTREZID", ont = "BP",
+                   universe = universe_entrez,
+                   pvalueCutoff = 0.05, readable = TRUE)
+
+ego_G1 <- enrichGO(entrez_G1, OrgDb = org.Hs.eg.db,
+                   keyType = "ENTREZID", ont = "BP",
+                   universe = universe_entrez,
+                   pvalueCutoff = 0.05, readable = TRUE)
+
+ego_G2 <- enrichGO(entrez_G2, OrgDb = org.Hs.eg.db,
+                   keyType = "ENTREZID", ont = "BP",
+                   universe = universe_entrez,
+                   pvalueCutoff = 0.05, readable = TRUE)
+
+
+### KEGG
+kegg_G0 <- enrichKEGG(entrez_G0, organism = "hsa",
+                      universe = universe_entrez,
+                      pvalueCutoff = 0.05)
+
+kegg_G1 <- enrichKEGG(entrez_G1, organism = "hsa",
+                      universe = universe_entrez,
+                      pvalueCutoff = 0.05)
+
+kegg_G2 <- enrichKEGG(entrez_G2, organism = "hsa",
+                      universe = universe_entrez,
+                      pvalueCutoff = 0.05)
+
+
+## ================================================================================
+## 8. GSEA (ReactomePA::gsePathway)
+## ================================================================================
+rank_G0 <- rank_genes(res_G0_df)
+rank_G1 <- rank_genes(res_G1_df)
+rank_G2 <- rank_genes(res_G2_df)
+
+gsea_G0 <- gsePathway(rank_G0, organism = "human", pvalueCutoff = 0.25)
+gsea_G1 <- gsePathway(rank_G1, organism = "human", pvalueCutoff = 0.25)
+gsea_G2 <- gsePathway(rank_G2, organism = "human", pvalueCutoff = 0.25)
+
+
+
+
+
+
+
+
+########### =====================--------------------final
+## ================================================================================
+## ================================================================================
+## 0. Libraries (assumed installed)
+## ================================================================================
+library(DESeq2)
+library(tidyverse)
+library(msigdbr)
+library(GSVA)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(enrichplot)
+library(AnnotationDbi)
+
+## Objects assumed to already exist from your DESeq2 pipeline:
+## dds, res_G0_EV, res_G1_EV, res_G2_EV, res_G0_EV_annot, res_G1_EV_annot, res_G2_EV_annot
+
+
+## ================================================================================
+## 1. Reactome gene sets in ENSEMBL (for GSVA + GSEA)
+## ================================================================================
+reactome_df <- msigdbr(
+  species       = "Homo sapiens",
+  collection    = "C2",
+  subcollection = "CP:REACTOME"
+)
+
+reactome_gs_ens <- split(reactome_df$ensembl_gene, reactome_df$gs_name)
+
+
+## ================================================================================
+## 2. Helper functions
+## ================================================================================
+
+### ENSEMBL → ENTREZ using org.Hs.eg.db (best effort)
+convert_ids <- function(ensembl_ids) {
+  ensembl_ids <- sub("\\..*", "", ensembl_ids)
+  conv <- suppressWarnings(
+    bitr(
+      ensembl_ids,
+      fromType = "ENSEMBL",
+      toType   = "ENTREZID",
+      OrgDb    = org.Hs.eg.db
+    )
+  )
+  unique(na.omit(conv$ENTREZID))
+}
+
+### Ranked vector for GSEA (ReactomePA::gsePathway) using ENSEMBL directly
+## df must contain:
+##   - gene_id (ENSEMBL, possibly with version)
+##   - stat   (DESeq2 Wald statistic)
+rank_genes <- function(df) {
+  ens_clean <- sub("\\..*", "", df$gene_id)
+  ranks <- df$stat
+  names(ranks) <- ens_clean
+  sort(ranks, decreasing = TRUE)
+}
+
+### GSVA heatmap
+plot_gsva_heatmap <- function(gsva_results, title, file) {
+  png(file, width = 1000, height = 800, res = 120)
+  pathway_vars <- apply(gsva_results, 1, var)
+  top_n <- min(30, nrow(gsva_results))
+  top_pathways <- gsva_results[order(pathway_vars, decreasing = TRUE)[1:top_n], ]
+  pheatmap(
+    top_pathways,
+    main  = title,
+    scale = "row",
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    fontsize_row = 7
+  )
   dev.off()
 }
 
 
-# ==============================================================================
-# PREPARE EXPRESSION MATRIX FOR GSVA
-# ==============================================================================
-
-# Use VST-normalized counts (best practice for GSVA)
+## ================================================================================
+## 3. Prepare VST matrix for GSVA (ENSEMBL rownames)
+## ================================================================================
 vsd <- vst(dds, blind = FALSE)
 mat <- assay(vsd)
 
-# Convert ENSEMBL → SYMBOL and collapse duplicates
-mat_sym <- convert_to_symbol(mat)
-mat_sym <- collapse_duplicates(mat_sym)
+## strip ENSEMBL versions
+rownames(mat) <- sub("\\..*", "", rownames(mat))
 
 
-# ==============================================================================
-# RUN GSVA (ONE TIME ONLY)
-# ==============================================================================
+## ================================================================================
+## 4. Run ssGSEA (GSVA) with ENSEMBL gene sets
+## ================================================================================
+param    <- ssgseaParam(mat, reactome_gs_ens)
+gsva_all <- GSVA::gsva(param)
 
-param <- ssgseaParam(mat_sym, reactome_gs)
-gsva_all <- gsva(param)   # pathways × samples matrix
 
-
-# ==============================================================================
-# SUBSET GSVA SCORES BY GENOTYPE
-# ==============================================================================
-
+## ================================================================================
+## 5. Subset GSVA scores by genotype
+## ================================================================================
 gsva_G0 <- gsva_all[, dds$genotype == "G0", drop = FALSE]
 gsva_G1 <- gsva_all[, dds$genotype == "G1", drop = FALSE]
 gsva_G2 <- gsva_all[, dds$genotype == "G2", drop = FALSE]
-gsva_GL <- gsva_all[, dds$genotype == "GL", drop = FALSE]
+gsva_EV <- gsva_all[, dds$genotype == "EV", drop = FALSE]
 
 
-# ==============================================================================
-# PLOT GENOTYPE-SPECIFIC PATHWAY ACTIVITY
-# ==============================================================================
-plot_gsva_heatmap(gsva_GL, "Top Reactome Pathways: GL Activity", "gsva_heatmap_GL.png")
-plot_gsva_heatmap(gsva_G2, "Top Reactome Pathways: G2 Activity", "gsva_heatmap_G2.png")
-plot_gsva_heatmap(gsva_G1, "Top Reactome Pathways: G1 Activity", "gsva_heatmap_G1.png")
-plot_gsva_heatmap(gsva_G0, "Top Reactome Pathways: G0 Activity", "gsva_heatmap_G0.png")
+## ================================================================================
+## 6. Plot GSVA heatmaps
+## ================================================================================
+plot_gsva_heatmap(gsva_EV, "Reactome ssGSEA – EV", "gsva_EV.png")
+plot_gsva_heatmap(gsva_G0, "Reactome ssGSEA – G0", "gsva_G0.png")
+plot_gsva_heatmap(gsva_G1, "Reactome ssGSEA – G1", "gsva_G1.png")
+plot_gsva_heatmap(gsva_G2, "Reactome ssGSEA – G2", "gsva_G2.png")
+
+
+## ================================================================================
+## 7. Universe for ORA (Reactome, GO, KEGG) in ENTREZ
+## ================================================================================
+universe_ens <- rownames(mat)  ## already version-stripped ENSEMBL
+valid_ens    <- universe_ens[universe_ens %in% keys(org.Hs.eg.db, keytype = "ENSEMBL")]
+universe_entrez <- convert_ids(valid_ens)
+
+
+## ================================================================================
+## 8. DEG lists in ENSEMBL → ENTREZ
+## ================================================================================
+## from your annotated results: res_G0_EV_annot, res_G1_EV_annot, res_G2_EV_annot
+sig_G0_ens <- res_G0_EV_annot %>%
+  filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>%
+  pull(ENSEMBL) %>%
+  na.omit()
+
+sig_G1_ens <- res_G1_EV_annot %>%
+  filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>%
+  pull(ENSEMBL) %>%
+  na.omit()
+
+sig_G2_ens <- res_G2_EV_annot %>%
+  filter(padj < 0.05, abs(log2FoldChange) >= 0.56) %>%
+  pull(ENSEMBL) %>%
+  na.omit()
+
+entrez_G0 <- convert_ids(sig_G0_ens)
+entrez_G1 <- convert_ids(sig_G1_ens)
+entrez_G2 <- convert_ids(sig_G2_ens)
+
+
+## ================================================================================
+## 9. Over-representation analysis (Reactome, GO BP, KEGG)
+## ================================================================================
+
+### ReactomePA ORA
+reactome_G0 <- enrichPathway(
+  gene         = entrez_G0,
+  universe     = universe_entrez,
+  organism     = "human",
+  pvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+reactome_G1 <- enrichPathway(
+  gene         = entrez_G1,
+  universe     = universe_entrez,
+  organism     = "human",
+  pvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+reactome_G2 <- enrichPathway(
+  gene         = entrez_G2,
+  universe     = universe_entrez,
+  organism     = "human",
+  pvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+### GO BP ORA
+ego_G0 <- enrichGO(
+  gene         = entrez_G0,
+  universe     = universe_entrez,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "ENTREZID",
+  ont          = "BP",
+  pvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+ego_G1 <- enrichGO(
+  gene         = entrez_G1,
+  universe     = universe_entrez,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "ENTREZID",
+  ont          = "BP",
+  pvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+ego_G2 <- enrichGO(
+  gene         = entrez_G2,
+  universe     = universe_entrez,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "ENTREZID",
+  ont          = "BP",
+  pvalueCutoff = 0.05,
+  readable     = TRUE
+)
+
+### KEGG ORA
+kegg_G0 <- enrichKEGG(
+  gene         = entrez_G0,
+  universe     = universe_entrez,
+  organism     = "hsa",
+  pvalueCutoff = 0.05
+)
+
+kegg_G1 <- enrichKEGG(
+  gene         = entrez_G1,
+  universe     = universe_entrez,
+  organism     = "hsa",
+  pvalueCutoff = 0.05
+)
+
+kegg_G2 <- enrichKEGG(
+  gene         = entrez_G2,
+  universe     = universe_entrez,
+  organism     = "hsa",
+  pvalueCutoff = 0.05
+)
+
+
+## ================================================================================
+## 10. GSEA (ReactomePA::gsePathway) using ENSEMBL IDs directly
+## ================================================================================
+## Build DEG tables with ENSEMBL gene_id + stat
+res_G0_df <- as.data.frame(res_G0_EV) %>% rownames_to_column("gene_id")
+res_G1_df <- as.data.frame(res_G1_EV) %>% rownames_to_column("gene_id")
+res_G2_df <- as.data.frame(res_G2_EV) %>% rownames_to_column("gene_id")
+
+rank_G0 <- rank_genes(res_G0_df)
+rank_G1 <- rank_genes(res_G1_df)
+rank_G2 <- rank_genes(res_G2_df)
+
+gsea_G0 <- gsePathway(rank_G0, organism = "human", pvalueCutoff = 0.25)
+gsea_G1 <- gsePathway(rank_G1, organism = "human", pvalueCutoff = 0.25)
+gsea_G2 <- gsePathway(rank_G2, organism = "human", pvalueCutoff = 0.25)
+
+
+## ================================================================================
+## 11. Visualization (ORA + GSEA)
+## ================================================================================
+
+## 11.1 Dotplots
+dotplot(reactome_G0, showCategory = 20) + ggtitle("Reactome ORA – G0 vs EV")
+dotplot(reactome_G1, showCategory = 20) + ggtitle("Reactome ORA – G1 vs EV")
+dotplot(reactome_G2, showCategory = 20) + ggtitle("Reactome ORA – G2 vs EV")
+
+dotplot(ego_G0, showCategory = 20) + ggtitle("GO BP ORA – G0 vs EV")
+dotplot(ego_G1, showCategory = 20) + ggtitle("GO BP ORA – G1 vs EV")
+dotplot(ego_G2, showCategory = 20) + ggtitle("GO BP ORA – G2 vs EV")
+
+dotplot(kegg_G0, showCategory = 20) + ggtitle("KEGG ORA – G0 vs EV")
+dotplot(kegg_G1, showCategory = 20) + ggtitle("KEGG ORA – G1 vs EV")
+dotplot(kegg_G2, showCategory = 20) + ggtitle("KEGG ORA – G2 vs EV")
+
+## 11.2 Enrichment maps (example for G0)
+emapplot(pairwise_termsim(reactome_G0))
+emapplot(pairwise_termsim(ego_G0))
+emapplot(pairwise_termsim(kegg_G0))
+
+## 11.3 Cnetplots (example for G0)
+cnetplot(reactome_G0, showCategory = 10)
+cnetplot(ego_G0,       showCategory = 10)
+cnetplot(kegg_G0,      showCategory = 10)
+
+## 11.4 GSEA ridgeplots
+ridgeplot(gsea_G0) + ggtitle("Reactome GSEA – G0 vs EV")
+ridgeplot(gsea_G1) + ggtitle("Reactome GSEA – G1 vs EV")
+ridgeplot(gsea_G2) + ggtitle("Reactome GSEA – G2 vs EV")
+
+## 11.5 GSEA running score example
+gseaplot2(gsea_G0, geneSetID = 1)
 
